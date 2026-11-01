@@ -112,6 +112,10 @@ type Request struct {
 	multipartErrChan       chan error
 	multipartCancelFunc    context.CancelFunc
 	multipartPipeWriter    *io.PipeWriter
+
+	// send is the per-Execute policy snapshot; never set by users and never
+	// shared across Client instances (it is created from Request.client).
+	send *policySend
 }
 
 // SetCorrelationID method is used to set the correlation ID for the request
@@ -1505,13 +1509,51 @@ func (r *Request) Execute(method, url string) (res *Response, err error) {
 
 	r.Method = method
 
+	// Bind this send to the Client policy stack snapshot. Every exit below
+	// (retry loop, middleware chains, redirect dispatch, timeout overlay)
+	// reads the same snapshot reached through Request.client; frames pushed by
+	// another goroutine after this entry cannot mutate this send, and a push
+	// from the current goroutine past a lifecycle boundary is rejected.
+	ss := r.client.beginPolicySend()
+	r.send = ss
+	defer func() {
+		r.client.endPolicySend(ss)
+		r.send = nil
+	}()
+	// Carry the snapshot on the request context so net/http's redirect
+	// dispatch reads this Client frame without per-send RedirectPolicy swap.
+	r.SetContext(context.WithValue(r.Context(), policySendKey{}, ss))
+
 	if r.RetryCount < 0 {
 		r.RetryCount = 0 // default behavior is no retry
 	}
 
+	// retry_surface is read here, at the retry exit, independently from the
+	// redirect and middleware exits. It merges with the flat
+	// RetryCount/AllowNonIdempotentRetry settings into local values only; the
+	// Client/Request flat fields are never rewritten and restored.
+	retrySurface := ss.retrySurface()
+	effRetryCount := r.RetryCount
+	switch retrySurface {
+	case RetrySurfaceForceNoRetry:
+		effRetryCount = 0
+	case RetrySurfaceForceRetryOnce:
+		if effRetryCount < 1 {
+			effRetryCount = 1
+		}
+	}
+
 	isIdempotent := r.isIdempotent()
+	if retrySurface == RetrySurfaceRejectNonIdempotentRetry {
+		// Strip the non-idempotent allowance for this frame; truly idempotent
+		// verbs remain retryable even under this frame.
+		if _, found := idempotentMethods[r.Method]; !found {
+			isIdempotent = false
+		}
+	}
+
 	var backoff *backoffWithJitter
-	if r.RetryCount > 0 && isIdempotent {
+	if effRetryCount > 0 && isIdempotent {
 		backoff = newBackoffWithJitter(r.RetryWaitTime, r.RetryMaxWaitTime)
 		r.SetCorrelationID(newGUID())
 	}
@@ -1530,8 +1572,9 @@ func (r *Request) Execute(method, url string) (res *Response, err error) {
 	}
 
 	isInvalidRequestErr := false
-	// first attempt + retry count = total attempts
-	for i := 0; i <= r.RetryCount; i++ {
+	// first attempt + retry count = total attempts (effRetryCount merges the
+	// frame retry_surface without rewriting r.RetryCount)
+	for i := 0; i <= effRetryCount; i++ {
 		r.Attempt++
 		err = nil
 		r.URL = url
@@ -1560,7 +1603,7 @@ func (r *Request) Execute(method, url string) (res *Response, err error) {
 
 		// we have reached the maximum no. of requests
 		// or request method is not an idempotent
-		if r.Attempt-1 == r.RetryCount || !isIdempotent {
+		if r.Attempt-1 == effRetryCount || !isIdempotent {
 			break
 		}
 
@@ -1735,6 +1778,7 @@ func (r *Request) Clone(ctx context.Context) *Request {
 	rr.multipartCancelFunc = nil
 	rr.multipartPipeWriter = nil
 	rr.ctxCancelFunc = nil
+	rr.send = nil
 
 	// copy bodyBuf
 	if r.bodyBuf != nil {
@@ -1951,16 +1995,47 @@ func (r *Request) isIdempotent() bool {
 	return found || r.IsRetryAllowNonIdempotent
 }
 
+// withTimeout builds the per-attempt *http.Request deadline. The timeout_overlay
+// dimension is read here, at the timeout exit, independently from the retry,
+// redirect and middleware exits:
+//   - [TimeoutOverlayPin]: the existing Client/Request Timeout logic.
+//   - [TimeoutOverlayFailFast]: a measurably shorter frame deadline is applied
+//     (context.WithTimeout naturally keeps the earlier of it and the parent
+//     deadline), and the deadline error is surfaced on timeout.
+//   - [TimeoutOverlayInheritOnly]: a shorter Timeout newly set on this Request
+//     is ignored; only the Client timeout captured when the frame was pushed
+//     is used.
 func (r *Request) withTimeout() *http.Request {
-	if _, found := r.Context().Deadline(); found {
-		return r.RawRequest
-	}
-	if r.Timeout > 0 {
-		ctx, ctxCancelFunc := context.WithTimeout(r.Context(), r.Timeout)
+	overlay, failFast, inheritOnly := r.send.timeoutView()
+
+	switch overlay {
+	case TimeoutOverlayFailFast:
+		ctx, ctxCancelFunc := context.WithTimeout(r.Context(), failFast)
 		r.ctxCancelFunc = ctxCancelFunc
 		return r.RawRequest.WithContext(ctx)
+
+	case TimeoutOverlayInheritOnly:
+		if _, found := r.Context().Deadline(); found {
+			return r.RawRequest
+		}
+		if inheritOnly > 0 {
+			ctx, ctxCancelFunc := context.WithTimeout(r.Context(), inheritOnly)
+			r.ctxCancelFunc = ctxCancelFunc
+			return r.RawRequest.WithContext(ctx)
+		}
+		return r.RawRequest
+
+	default:
+		if _, found := r.Context().Deadline(); found {
+			return r.RawRequest
+		}
+		if r.Timeout > 0 {
+			ctx, ctxCancelFunc := context.WithTimeout(r.Context(), r.Timeout)
+			r.ctxCancelFunc = ctxCancelFunc
+			return r.RawRequest.WithContext(ctx)
+		}
+		return r.RawRequest
 	}
-	return r.RawRequest
 }
 
 func jsonIndent(v []byte) []byte {

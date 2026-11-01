@@ -277,6 +277,15 @@ type Client struct {
 	circuitBreaker             CircuitBreaker
 	hedging                    Hedger
 	rateLimiter                RateLimiter
+
+	// Client-bound request runtime policy stack. It is guarded by policyMu and
+	// is deliberately separate from lock: the send path must not take lock
+	// while holding policyMu. See policy.go.
+	policyMu         *sync.Mutex
+	policySeq        uint64
+	policyStack      []policyFrameEntry
+	activeSends      map[int64][]*policySend
+	redirectPolicies []RedirectPolicy
 }
 
 // CertWatcherOptions configures the certificate file watcher that reloads TLS
@@ -1369,14 +1378,10 @@ func (c *Client) newErrorInterface() any {
 func (c *Client) SetRedirectPolicy(policies ...RedirectPolicy) *Client {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	c.httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		for _, p := range policies {
-			if err := p.Apply(req, via); err != nil {
-				return err
-			}
-		}
-		return nil // looks good, go ahead
-	}
+	c.redirectPolicies = policies
+	// Keep the permanent frame-aware dispatcher in place instead of swapping
+	// policies per send; it reads the entry snapshot of each request.
+	c.httpClient.CheckRedirect = c.redirectCheckRedirect
 	return c
 }
 
@@ -2456,6 +2461,16 @@ func (c *Client) Clone(ctx context.Context) *Client {
 	cc.lock = &sync.RWMutex{}
 	cc.certWatcherStopChan = make(chan bool)
 	cc.isClosed = false
+
+	// The policy stack and active-send registry are request-scoped runtime
+	// state owned by the original client; the clone starts with an empty
+	// stack and its own lock/map.
+	cc.policyMu = &sync.Mutex{}
+	cc.policySeq = 0
+	cc.policyStack = nil
+	cc.activeSends = nil
+	cc.redirectPolicies = slicesClonePolicies(c.redirectPolicies)
+	cc.httpClient.CheckRedirect = cc.redirectCheckRedirect
 	return cc
 }
 
@@ -2488,6 +2503,56 @@ func (c *Client) executeRequestMiddlewares(req *Request) (err error) {
 		}
 	}
 	return nil
+}
+
+// executeBeforeRequest runs the OnBeforeRequest chain under the send's
+// middleware_gate. It reads that dimension here, at the request-middleware
+// exit; it does not share a read with the retry or redirect paths. Under
+// [MiddlewareGateSkipBefore], user hooks are suppressed and only the mandatory
+// request preparation (which builds Request.RawRequest) is performed; the
+// middleware slice itself is never mutated.
+func (c *Client) executeBeforeRequest(req *Request) error {
+	if req.send == nil || !req.send.middlewareSkipBefore() {
+		return c.executeRequestMiddlewares(req)
+	}
+
+	ranPrepare := false
+	for _, f := range c.requestMiddlewares() {
+		if !isBuiltinRequestMiddleware(f) {
+			continue
+		}
+		ranPrepare = true
+		if err := f(c, req); err != nil {
+			return err
+		}
+	}
+	if !ranPrepare && req.RawRequest == nil {
+		if err := MiddlewareRequestCreate(c, req); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// executeAfterResponse runs the OnAfterResponse chain under the send's
+// middleware_gate. Under [MiddlewareGateSkipAfter], user response hooks are
+// suppressed on both success and failure, while the built-in response
+// middlewares (body auto-parse, save-to-file) keep running so the response
+// stays fully consumed. The middleware slice itself is never mutated.
+func (c *Client) executeAfterResponse(response *Response) error {
+	var err error
+	chain := c.responseMiddlewares()
+	skipUserHooks := response.Request.send != nil && response.Request.send.middlewareSkipAfter()
+
+	for _, f := range chain {
+		if skipUserHooks && !isBuiltinResponseMiddleware(f) {
+			continue
+		}
+		if err = f(c, response); err != nil {
+			response.CascadeError = wrapErrors(err, response.CascadeError)
+		}
+	}
+	return response.wrapError(nil, false)
 }
 
 func (c *Client) cbRequestError() {
@@ -2524,7 +2589,8 @@ func (c *Client) execute(req *Request) (*Response, error) {
 		}
 	}
 
-	if err := c.executeRequestMiddlewares(req); err != nil {
+	req.send.setPhase(policyPhaseBefore)
+	if err := c.executeBeforeRequest(req); err != nil {
 		c.cbRequestError()
 		return nil, err
 	}
@@ -2536,6 +2602,7 @@ func (c *Client) execute(req *Request) (*Response, error) {
 	prepareRequestDebugInfo(c, req)
 
 	req.StartTime = time.Now()
+	req.send.setPhase(policyPhaseWire)
 	resp, err := c.Client().Do(req.withTimeout())
 	// Stop multipart production once the transport has returned. Cancel alone
 	// is not enough when a source Reader is already blocked inside Read; also
@@ -2614,14 +2681,11 @@ func (c *Client) execute(req *Request) (*Response, error) {
 
 	debugLogger(c, response)
 
-	// Apply Response middleware
-	for _, f := range c.responseMiddlewares() {
-		if err = f(c, response); err != nil {
-			response.CascadeError = wrapErrors(err, response.CascadeError)
-		}
-	}
-
-	return response, response.wrapError(nil, false)
+	// Apply Response middleware under the send's middleware_gate. This reads
+	// middleware_gate at the response-middleware exit, independently from the
+	// retry and redirect exits.
+	req.send.setPhase(policyPhaseAfter)
+	return response, c.executeAfterResponse(response)
 }
 
 // getting TLS client config if not exists then create one

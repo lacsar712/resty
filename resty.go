@@ -186,6 +186,7 @@ func createClient(hc *http.Client) *Client {
 		contentDecompresserKeys:  make([]string, 0),
 		contentDecompressers:     make(map[string]ContentDecompresser),
 		certWatcherStopChan:      make(chan bool),
+		policyMu:                 &sync.Mutex{},
 	}
 
 	// Logger
@@ -212,6 +213,20 @@ func createClient(hc *http.Client) *Client {
 		MiddlewareResponseAutoParse,
 		MiddlewareResponseSaveToFile,
 	)
+
+	// Install the permanent frame-aware redirect dispatcher so policy frames
+	// can intervene per send without swapping CheckRedirect at runtime. A
+	// CheckRedirect supplied by the user via NewWithClient is preserved as a
+	// configured policy.
+	if hc.CheckRedirect != nil {
+		userCheckRedirect := hc.CheckRedirect
+		c.redirectPolicies = []RedirectPolicy{
+			RedirectPolicyFunc(func(req *http.Request, via []*http.Request) error {
+				return userCheckRedirect(req, via)
+			}),
+		}
+	}
+	hc.CheckRedirect = c.redirectCheckRedirect
 
 	return c
 }
